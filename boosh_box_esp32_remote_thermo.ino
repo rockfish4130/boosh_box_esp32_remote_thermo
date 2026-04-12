@@ -2,7 +2,7 @@
 Lava Lounge DJ Boosh Box Remote Thermo
 
 Used for monitoring temperature of fuel depo tanks. 
-2 100kOhm thermisters in a 100k + 100k divider across 3.3V
+2 10kOhm thermisters in a 100k + 100k divider across 3.3V
 pins:
 5 (ADC1_0)
 8 (ADC1_3)
@@ -14,6 +14,7 @@ Measure temperatures once per second i an timer ISR
 Using board 'lolin32' from platform in folder: C:\Users\Matt\AppData\Local\Arduino15\packages\esp32\hardware\esp32\2.0.11
 Using core 'esp32' from platform in folder: C:\Users\Matt\AppData\Local\Arduino15\packages\esp32\hardware\esp32\2.0.11
 Board type: WEMOS LOLIN32 
+Board pinout: https://mischianti.org/wp-content/uploads/2020/11/ESP32-WeMos-LOLIN32-pinout-mischianti.png
 CPU 80MHz
 Debug level: none
 Flash 80MHz
@@ -39,14 +40,20 @@ Memory usage:
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
 #include <esp_task_wdt.h>
-#include "soc/rtc_wdt.h" // 2025: file missing after updated esp32 3.0.7, was built with 2.0.11
+#if __has_include("soc/rtc_wdt.h")
+#include "soc/rtc_wdt.h"
+#define BOOSH_HAS_RTC_WDT 1
+#else
+#define BOOSH_HAS_RTC_WDT 0
+#endif
 #include "wifi_credentials.h" // Intentionally omitted from Git for security. Defines BOOSH_WIFI_SSID and BOOSH_WIFI_PASS.
 
 #define SW_REV_CODE "ESP32_2025_02_01_0030" // Echo a rev code on Serial0 for identifying version in the field
 #define WDT_TIMEOUT 10     // define a 10 seconds WDT (Watch Dog Timer) TODO: debug
 
-
-#define LED_BUILTIN 5 //ESP32 module LED
+#ifndef STATUS_LED_PIN
+#define STATUS_LED_PIN -1 // Set to a GPIO if a user LED is available on the selected board.
+#endif
 
 #define DEBUG_DISPLAY_DIAGNOSTIC_UPDATE_PERIOD_MSEC 500 // Update period in msec when dumping status to Serial
 
@@ -66,14 +73,14 @@ int httpResponseCode = -999; // make this a global so we can dump it to the web 
 // state variables, flags, timestamps
 unsigned long currentMillis = 0;
 bool enableSerial0DisplayUpdates = 0; // Flag to dump hardware states to Serial0 for debug/dev
-unsigned long lastADCMeasurementTimeMsec = 0; // debug heatbeat pulse timestamp
+volatile unsigned long lastADCMeasurementTimeMsec = 0; // debug heartbeat pulse timestamp
 
 unsigned long lastDisplayDiagnosticSerialDumpTimeMsec = 0 ; // timestamp of last displayDiagnosticUpdate
 
 unsigned long timerPeriodADCISRMeasuSec = 3000000; // 3 seconds between ADC measurements in the ISR
 
-bool flagNeedToPostNewTempMeasurement = 0; // ISR sets this, main loop handles the HTTP GET
-bool flagNeedToCalculateNewTempMeasurement = 0; // ISR sets this, main loop handles floating point, log etc
+volatile bool flagNeedToPostNewTempMeasurement = 0; // ISR sets this, main loop handles the HTTP GET
+volatile bool flagNeedToCalculateNewTempMeasurement = 0; // ISR sets this, main loop handles floating point, log etc
 
 unsigned long lastHttpPostTimeMSec = 0; // mSec timestamp of last time temperatures were HTTP GET to DJ BOOSH BOX
 unsigned long lastHttpPostIntervalMSec = 10000; // mSec interval to actually send 
@@ -88,17 +95,23 @@ IPAddress DJBOOSHBOXIp = IPAddress(1, 1, 1, 1);
 IPAddress lastDJBOOSHBOXIp = IPAddress(1, 1, 1, 1);
 
 IPAddress resolve_mdns_host(const char* host_name);  // to resolve host IPs
+void serviceWebInterface();
+void serial0DebugCom();
+void displayDiagnosticUpdate();
 unsigned long lastmDNSLookupTimeStampMSec = 0;
 unsigned long mDNSLookupTimeIntervalMSec = 60 * 1000; // set to 60 for production
 #define THERMISTOR_COUNT 2
 
 
-// #define THERMISTOR_PIN1 36   // module pins (GPIO36) and (GPIO36) connected to thermister 100+100k divider circuit across 3.3V
-// #define THERMISTOR_PIN2 39
+// Keep thermistor inputs on the ESP32 ADC1-only input pins so Wi-Fi does not steal the ADC.
+// On the target ESP32 OLED board these are the pins labeled VP/GPIO36 and VN/GPIO39.
+#ifndef THERMISTOR_PIN1
+#define THERMISTOR_PIN1 36
+#endif
 
-// https://iotlearner.com/2024/03/12/esp32-pinout-guide-understand-every-pin/
-#define THERMISTOR_PIN1 A0   // module pins (GPIO36) and (GPIO36) connected to thermister 100+100k divider circuit across 3.3V
-#define THERMISTOR_PIN2 A3
+#ifndef THERMISTOR_PIN2
+#define THERMISTOR_PIN2 39
+#endif
 
 #define THERMISTOR_MEAS_AVG_COUNT 16 // number of ADC measurements to perform and average, MUST be a power of 2 as we use int right shifts to avoid floating point in the ISR!
 #define THERMISTOR_MEAS_AVG_DELAY_USEC 100 // uSec between measurements
@@ -134,7 +147,9 @@ void IRAM_ATTR IRQdoADCMeasurement() {
   int j;
   lastADCMeasurementTimeMsec = millis();
   
-  digitalWrite(LED_BUILTIN,!digitalRead(LED_BUILTIN)); // toggle LED
+  if (STATUS_LED_PIN >= 0) {
+    digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN));
+  }
 
   Vo = 0;
   
@@ -157,7 +172,10 @@ void setup()
 {
     int cntWifiTimeout = 0;
     
-    pinMode(LED_BUILTIN, OUTPUT);      // set the LED pin mode
+    if (STATUS_LED_PIN >= 0) {
+      pinMode(STATUS_LED_PIN, OUTPUT);
+      digitalWrite(STATUS_LED_PIN, LOW);
+    }
 
     delay(200);
 
@@ -192,8 +210,10 @@ void setup()
   
     server.begin();
 
-    rtc_wdt_protect_off(); //https://stackoverflow.com/questions/51750377/how-to-disable-interrupt-watchdog-in-esp32-or-increase-isr-time-limit
-    rtc_wdt_disable(); //https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/wdts.html
+    if (BOOSH_HAS_RTC_WDT) {
+      rtc_wdt_protect_off(); //https://stackoverflow.com/questions/51750377/how-to-disable-interrupt-watchdog-in-esp32-or-increase-isr-time-limit
+      rtc_wdt_disable(); //https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/wdts.html
+    }
 
     // IRQ
     // at 1 second, toggle right hand GPIOs
@@ -219,7 +239,7 @@ void loop(){
 
   serviceWebInterface();
 
-  // Debug heatbeat pulse: every 200ms or so, toggle LED_BUILTIN for a visual heartbeat inside the plastic case
+  // Debug heartbeat pulse: if a status LED is configured, the ISR toggles it.
   if ( ((currentMillis - lastDisplayDiagnosticSerialDumpTimeMsec ) > DEBUG_DISPLAY_DIAGNOSTIC_UPDATE_PERIOD_MSEC) || (currentMillis < lastDisplayDiagnosticSerialDumpTimeMsec ) ) {
     displayDiagnosticUpdate();
     // visualHeartbeat();
@@ -491,10 +511,14 @@ void serviceWebInterface() {
 
         // Check to see if the client request was "GET /H" or "GET /L":
         if (currentLine.endsWith("GET /H")) {
-          digitalWrite(5, HIGH);               // GET /H turns the LED on
+          if (STATUS_LED_PIN >= 0) {
+            digitalWrite(STATUS_LED_PIN, HIGH);
+          }
         }
         if (currentLine.endsWith("GET /L")) {
-          digitalWrite(5, LOW);                // GET /L turns the LED off
+          if (STATUS_LED_PIN >= 0) {
+            digitalWrite(STATUS_LED_PIN, LOW);
+          }
         }
         // web easter egg
         if (currentLine.endsWith("MSW")) {
@@ -637,7 +661,11 @@ void displayDiagnosticUpdate() {
     Serial.print("mils:");
     Serial.print(currentMillis);
     Serial.print(", LED:");
-    Serial.print((digitalRead(LED_BUILTIN) == HIGH));
+    if (STATUS_LED_PIN >= 0) {
+      Serial.print((digitalRead(STATUS_LED_PIN) == HIGH));
+    } else {
+      Serial.print("n/a");
+    }
     
     Serial.print(",");
     Serial.print(String(timerPeriodADCISRMeasuSec));
@@ -657,9 +685,6 @@ void displayDiagnosticUpdate() {
       Serial.print(" = ");
       Serial.print(adcRawReads[i]);
     }
-    Serial.print(" = ");
-    Serial.print(adcRawReads[i]);
-
     Serial.println("");
   }
 }
