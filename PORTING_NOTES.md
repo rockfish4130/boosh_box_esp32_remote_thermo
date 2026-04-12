@@ -26,3 +26,10 @@ This project was developed as an Arduino IDE sketch for a `WEMOS LOLIN32` and ha
 - PlatformIO build succeeded for environment `esp32-oled`.
 - Firmware upload succeeded to `COM12`.
 - The attached device identified itself during upload as `ESP32-D0WD-V3`.
+
+## Power Notes
+
+- Firmware now forces the ESP32 CPU clock to `80 MHz`.
+- Bluetooth is disabled and controller memory is released.
+- Periodic mDNS refresh is reduced to boot, every 15 minutes, or shortly after an HTTP failure instead of constant 1-minute refresh.
+- In bench testing after these changes, observed current draw dropped to roughly `60 mA` average or lower at about `3.7 V`.

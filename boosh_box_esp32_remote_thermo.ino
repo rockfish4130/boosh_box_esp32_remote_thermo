@@ -10,6 +10,7 @@ Yellow Blue Display with ESP32-N4XX module
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
+#include <esp_bt.h>
 #include <esp_task_wdt.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -62,6 +63,7 @@ Yellow Blue Display with ESP32-N4XX module
 #define NETWORK_HOSTNAME "REMOTETHERMO"
 #define TARGET_HOSTNAME "RPIBOOSH"
 #define WIFI_CONNECTION_TIMEOUT_SECS 30
+#define CPU_FREQ_MHZ 80
 
 #define THERMISTOR_COUNT 2
 #define THERMISTOR_MEAS_AVG_COUNT 16
@@ -111,7 +113,7 @@ String serverPath;
 IPAddress DJBOOSHBOXIp = IPAddress(1, 1, 1, 1);
 IPAddress lastDJBOOSHBOXIp = IPAddress(1, 1, 1, 1);
 unsigned long lastmDNSLookupTimeStampMSec = 0;
-unsigned long mDNSLookupTimeIntervalMSec = 60 * 1000;
+unsigned long mDNSLookupTimeIntervalMSec = 15UL * 60UL * 1000UL;
 
 const int ThermistorPins[THERMISTOR_COUNT] = {THERMISTOR_PIN1, THERMISTOR_PIN2};
 int Vo;
@@ -764,6 +766,9 @@ void drawOledSystemPage() {
   oled.println(String(FW_BUILD_TIME));
   oled.print("UP ");
   oled.println(formatUptimeHMS(millis()));
+  oled.print("CPU ");
+  oled.print(getCpuFrequencyMhz());
+  oled.println("MHz");
   oled.display();
 }
 
@@ -878,6 +883,8 @@ bool connectToPreferredWifi() {
 }
 
 void setup() {
+  setCpuFrequencyMhz(CPU_FREQ_MHZ);
+
   if (STATUS_LED_PIN >= 0) {
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, LOW);
@@ -891,11 +898,16 @@ void setup() {
   Serial.begin(115200);
   delay(10);
 
+  esp_bt_controller_disable();
+  esp_bt_mem_release(ESP_BT_MODE_BTDM);
+
   initOledDisplay();
 
   WiFi.setHostname(NETWORK_HOSTNAME);
   if (connectToPreferredWifi()) {
     Serial.println("WiFi connected.");
+    Serial.print("CPU MHz: ");
+    Serial.println(getCpuFrequencyMhz());
     Serial.println(WiFi.localIP());
     Serial.println(WiFi.SSID());
     Serial.println(WiFi.RSSI());
@@ -962,7 +974,11 @@ void loop() {
     appendTemperatureHistory(T[0], T[1], millis());
   }
 
-  if (((millis() - lastmDNSLookupTimeStampMSec) > mDNSLookupTimeIntervalMSec) || (lastmDNSLookupTimeStampMSec == 0)) {
+  bool shouldRefreshMdns = (lastmDNSLookupTimeStampMSec == 0) ||
+                           ((millis() - lastmDNSLookupTimeStampMSec) > mDNSLookupTimeIntervalMSec) ||
+                           (httpResponseCode <= 0 && (millis() - lastHttpPostTimeMSec) < 30000UL);
+
+  if (shouldRefreshMdns) {
     lastmDNSLookupTimeStampMSec = millis();
     DJBOOSHBOXIp = resolve_mdns_host(TARGET_HOSTNAME);
     Serial.println("in mDNSLookupTimeIntervalMSec...");
