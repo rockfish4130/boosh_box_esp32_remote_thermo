@@ -11,6 +11,7 @@ Yellow Blue Display with ESP32-N4XX module
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
 #include <esp_bt.h>
+#include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -75,6 +76,8 @@ Yellow Blue Display with ESP32-N4XX module
 #define TEMP_HISTORY_CAPACITY ((TEMP_HISTORY_DAYS * 24UL * 60UL * 60UL * 1000UL) / TEMP_HISTORY_SAMPLE_PERIOD_MSEC)
 #define TEMP_HISTORY_API_MAX_POINTS 480
 #define OLED_PAGE_PERIOD_MSEC 3500UL
+#define LOG_LINE_MAX_LEN 120
+#define LOG_LINE_COUNT 96
 
 struct TempHistoryPoint {
   unsigned long millisStamp;
@@ -90,6 +93,12 @@ enum OledPage {
   OLED_PAGE_COUNT = 4
 };
 
+const uint8_t OLED_PAGE_SEQUENCE[] = {
+  OLED_PAGE_TEMPS, OLED_PAGE_TEMPS, OLED_PAGE_TEMPS, OLED_PAGE_TEMPS, OLED_PAGE_TEMPS,
+  OLED_PAGE_TEMPS, OLED_PAGE_TEMPS, OLED_PAGE_WIFI, OLED_PAGE_HTTP, OLED_PAGE_SYSTEM
+};
+const int OLED_PAGE_SEQUENCE_LEN = sizeof(OLED_PAGE_SEQUENCE) / sizeof(OLED_PAGE_SEQUENCE[0]);
+
 hw_timer_t *myTimerBPMPulseBoosh = NULL;
 WiFiServer server(80);
 HTTPClient http;
@@ -103,6 +112,7 @@ unsigned long lastDisplayDiagnosticSerialDumpTimeMsec = 0;
 unsigned long timerPeriodADCISRMeasuSec = 3000000;
 volatile bool flagNeedToPostNewTempMeasurement = 0;
 volatile bool flagNeedToCalculateNewTempMeasurement = 0;
+volatile bool flagNeedToSampleADC = 0;
 unsigned long lastHttpPostTimeMSec = 0;
 unsigned long lastHttpPostIntervalMSec = 10000;
 unsigned long lastHttpReponseGoodTimestampMsec = 0;
@@ -119,14 +129,20 @@ const int ThermistorPins[THERMISTOR_COUNT] = {THERMISTOR_PIN1, THERMISTOR_PIN2};
 int Vo;
 volatile int adcRawReads[THERMISTOR_COUNT];
 float R1 = 10000;
-float logR2, R2, T[THERMISTOR_COUNT] = {0.0F, 0.0F};
+float logR2, R2, T[THERMISTOR_COUNT] = {NAN, NAN};
 float c1 = 1.274219988e-03F, c2 = 2.171368266e-04F, c3 = 1.119659695e-07F;
 float manualTempOffsetF = 11.17F;
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
 
 TempHistoryPoint tempHistory[TEMP_HISTORY_CAPACITY];
 int tempHistoryCount = 0;
 int tempHistoryNextIndex = 0;
 unsigned long lastTempHistoryStoreMillis = 0;
+String logLines[LOG_LINE_COUNT];
+int logLineNextIndex = 0;
+int logLineCount = 0;
+bool lastTempsWereValid = false;
+int lastLoggedHttpResponseCode = -999999;
 
 bool oledAvailable = false;
 unsigned long lastOledPageChangeMsec = 0;
@@ -146,7 +162,15 @@ bool connectToPreferredWifi();
 String buildDashboardHtml();
 String buildStatusJson(bool includeHistory);
 String buildHistoryJson();
+String buildLogJson();
 String buildTemperaturePlotSvg(unsigned long lookbackMs, const char *emptyLabel, const char *timeAxisLabel);
+String formatUptimeHMS(unsigned long ms);
+String formatAgeSeconds(unsigned long sinceMillis);
+String formatTempDisplay(float value);
+String resetReasonToString(esp_reset_reason_t reason);
+void appendLogLine(const String &line);
+void logEvent(const String &line);
+void logHttpEvent(const String &label, int code, const String &detail = "");
 
 String buildVersionString() {
   return String(FW_VERSION) + " " + String(FW_BUILD_DATE) + " " + String(FW_BUILD_TIME);
@@ -226,6 +250,58 @@ String formatFloat1(float value) {
     return "N/A";
   }
   return String(value, 1);
+}
+
+void appendLogLine(const String &line) {
+  String stamped = "[" + formatUptimeHMS(millis()) + "] " + line;
+  if ((int)stamped.length() > LOG_LINE_MAX_LEN) {
+    stamped = stamped.substring(0, LOG_LINE_MAX_LEN - 3) + "...";
+  }
+  logLines[logLineNextIndex] = stamped;
+  logLineNextIndex = (logLineNextIndex + 1) % LOG_LINE_COUNT;
+  if (logLineCount < LOG_LINE_COUNT) {
+    logLineCount++;
+  }
+}
+
+void logEvent(const String &line) {
+  Serial.println(line);
+  appendLogLine(line);
+}
+
+void logHttpEvent(const String &label, int code, const String &detail) {
+  if ((code == lastLoggedHttpResponseCode) && detail.length() == 0) {
+    return;
+  }
+  String line = label + " code=" + String(code);
+  if (detail.length() > 0) {
+    line += " " + detail;
+  }
+  logEvent(line);
+  lastLoggedHttpResponseCode = code;
+}
+
+String formatTempDisplay(float value) {
+  if (!isfinite(value)) {
+    return "--";
+  }
+  return String((int)lroundf(value));
+}
+
+String resetReasonToString(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_EXT: return "EXT";
+    case ESP_RST_SW: return "SW";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "UNKNOWN";
+  }
 }
 
 String formatUptimeHMS(unsigned long ms) {
@@ -463,6 +539,23 @@ String buildHistoryJson() {
   return json;
 }
 
+String buildLogJson() {
+  String json;
+  json.reserve(LOG_LINE_COUNT * 96);
+  json += "{";
+  json += "\"count\":" + String(logLineCount) + ",";
+  json += "\"log\":\"";
+  for (int i = 0; i < logLineCount; ++i) {
+    int idx = (logLineNextIndex - logLineCount + i + LOG_LINE_COUNT) % LOG_LINE_COUNT;
+    if (i > 0) {
+      json += "\\n";
+    }
+    json += jsonEscape(logLines[idx]);
+  }
+  json += "\"}";
+  return json;
+}
+
 String buildStatusJson(bool includeHistory) {
   String json;
   json.reserve(includeHistory ? 12000 : 5000);
@@ -505,8 +598,14 @@ String buildStatusJson(bool includeHistory) {
     json += "{";
     json += "\"index\":" + String(i) + ",";
     json += "\"gpio\":" + String(ThermistorPins[i]) + ",";
-    json += "\"temperatureF\":" + String(T[i], 3) + ",";
-    json += "\"temperatureRoundedF\":" + String((int)lroundf(T[i])) + ",";
+    json += "\"temperatureF\":";
+    if (isfinite(T[i])) json += String(T[i], 3);
+    else json += "null";
+    json += ",";
+    json += "\"temperatureRoundedF\":";
+    if (isfinite(T[i])) json += String((int)lroundf(T[i]));
+    else json += "null";
+    json += ",";
     json += "\"adcRaw\":" + String(adcRawReads[i]);
     json += "}";
   }
@@ -531,6 +630,11 @@ String buildStatusJson(bool includeHistory) {
   json += "\"lastUrl\":\"" + jsonEscape(serverPath) + "\"";
   json += "}";
 
+  json += ",";
+  json += "\"reset\":{";
+  json += "\"reason\":\"" + jsonEscape(resetReasonToString(bootResetReason)) + "\"";
+  json += "}";
+
   if (includeHistory) {
     json += ",";
     json += "\"history\":" + buildHistoryJson();
@@ -550,7 +654,6 @@ String buildDashboardHtml() {
 
   html += "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<meta http-equiv='refresh' content='5'>";
   html += "<title>REMOTETHERMO Dashboard</title>";
   html += "<style>";
   html += ":root{--bg:#0b0f14;--panel:#131a23;--panel2:#192230;--text:#edf3fb;--muted:#9aacbf;--accent:#ff8b6b;--accent2:#7ce3b0;--border:#263244;}";
@@ -572,6 +675,9 @@ String buildDashboardHtml() {
   html += ".kv{display:grid;grid-template-columns:160px 1fr;gap:8px;font-size:14px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.05);}";
   html += ".kv .k{color:var(--muted);} .kv .v{color:#f3f7fd;word-break:break-word;}";
   html += ".mono{font-family:Consolas,Monaco,monospace;}";
+  html += ".panel{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 8px 30px rgba(0,0,0,0.2);}";
+  html += "#log{background:#05080d;color:#b9ffd6;min-height:260px;max-height:420px;overflow:auto;font:13px/1.35 Consolas,monospace;border-radius:12px;padding:12px;border:1px solid #193022}";
+  html += "#log pre{margin:0;white-space:pre-wrap}";
   html += ".graph-wrap{margin-top:18px;background:linear-gradient(180deg,#121823,#0d1219);border:1px solid var(--border);border-radius:16px;padding:14px;}";
   html += ".graph-wrap h2{margin:0 0 8px;font-size:18px;color:#ffd0c3;}";
   html += ".temp-plot{width:100%;height:auto;display:block;}";
@@ -634,21 +740,40 @@ String buildDashboardHtml() {
   html += "<section class='card'><h2>System</h2>";
   html += "<div class='kv'><div class='k'>Version</div><div class='v mono'>" + htmlEscape(buildVersionString()) + "</div></div>";
   html += "<div class='kv'><div class='k'>Build code</div><div class='v mono'>" + htmlEscape(String(SW_REV_CODE)) + "</div></div>";
+  html += "<div class='kv'><div class='k'>Reset reason</div><div class='v mono'>" + htmlEscape(resetReasonToString(bootResetReason)) + "</div></div>";
   html += "<div class='kv'><div class='k'>Millis</div><div class='v mono'>" + String(millis()) + "</div></div>";
   html += "<div class='kv'><div class='k'>Uptime</div><div class='v mono'>" + formatUptimeHMS(millis()) + "</div></div>";
-  html += "<div class='kv'><div class='k'>API</div><div class='v mono'>/api/status and /api/history</div></div>";
+  html += "<div class='kv'><div class='k'>API</div><div class='v mono'>/api/status, /api/history, /api/logs</div></div>";
   html += "</section>";
 
   html += "</div>";
 
+  html += "<div class='grid' style='margin-top:16px'>";
+  html += "<section class='panel'><h2>Serial Console</h2><div id='log'><pre id='log-text'>";
+  for (int i = 0; i < logLineCount; ++i) {
+    int idx = (logLineNextIndex - logLineCount + i + LOG_LINE_COUNT) % LOG_LINE_COUNT;
+    html += htmlEscape(logLines[idx]);
+    if (i + 1 < logLineCount) {
+      html += "\n";
+    }
+  }
+  html += "</pre></div></section>";
+  html += "</div>";
+
   html += "<section class='graph-wrap'><h2>T0 / T1 Temperature History</h2>";
-  html += "<div class='kv'><div class='k'>History buffer</div><div class='v mono'>" + String(tempHistoryCount) + " points stored, 1 point per minute, about 5 days retained</div></div>";
+  html += "<div class='kv'><div class='k'>History buffer</div><div class='v mono'>" + String(tempHistoryCount) + " points stored, 1 point per " + String(TEMP_HISTORY_SAMPLE_PERIOD_MSEC / 60000UL) + " minutes, about 5 days retained</div></div>";
   html += "<h2 style='margin-top:16px'>Last 30 Minutes</h2>";
   html += buildTemperaturePlotSvg(30UL * 60UL * 1000UL, "Need at least 2 temperature samples in the last 30 minutes.", "uptime (last 30 min)");
   html += "<h2 style='margin-top:20px'>All Stored Data</h2>";
   html += buildTemperaturePlotSvg(0, "Need at least 2 stored temperature samples.", "uptime (full retained history)");
   html += "</section>";
 
+  html += "<script>";
+  html += "async function fetchJson(url){const res=await fetch(url,{cache:'no-store'});if(!res.ok) throw new Error(await res.text());return res.json();}";
+  html += "async function refreshLogs(){const data=await fetchJson('/api/logs');const text=document.getElementById('log-text');const box=document.getElementById('log');if(text&&box){text.textContent=data.log||'';box.scrollTop=box.scrollHeight;}}";
+  html += "setInterval(()=>{refreshLogs().catch(()=>{});},3000);";
+  html += "refreshLogs().catch(()=>{});";
+  html += "</script>";
   html += "</div></body></html>";
   return html;
 }
@@ -664,26 +789,10 @@ void sendHttpResponse(WiFiClient &client, const char *contentType, const String 
 }
 
 void IRAM_ATTR IRQdoADCMeasurement() {
-  int i;
-  int j;
-  lastADCMeasurementTimeMsec = millis();
-
   if (STATUS_LED_PIN >= 0) {
     digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN));
   }
-
-  Vo = 0;
-  for (i = 0; i < THERMISTOR_COUNT; ++i) {
-    adcRawReads[i] = 0;
-    for (j = 0; j < THERMISTOR_MEAS_AVG_COUNT; ++j) {
-      adcRawReads[i] += analogRead(ThermistorPins[i]);
-      delayMicroseconds(THERMISTOR_MEAS_AVG_DELAY_USEC);
-    }
-    adcRawReads[i] = adcRawReads[i] >> THERMISTOR_MEAS_AVG_RIGHT_BIT_SHIFT;
-  }
-
-  flagNeedToPostNewTempMeasurement = 1;
-  flagNeedToCalculateNewTempMeasurement = 1;
+  flagNeedToSampleADC = 1;
 }
 
 void initOledDisplay() {
@@ -713,10 +822,10 @@ void drawOledTempsPage() {
 
   oled.setTextSize(4);
   oled.setCursor(18, 0);
-  oled.print((int)lroundf(T[0]));
+  oled.print(formatTempDisplay(T[0]));
   oled.print("F");
   oled.setCursor(18, 32);
-  oled.print((int)lroundf(T[1]));
+  oled.print(formatTempDisplay(T[1]));
   oled.print("F");
   oled.display();
 }
@@ -766,6 +875,7 @@ void drawOledSystemPage() {
   oled.println(String(FW_BUILD_TIME));
   oled.print("UP ");
   oled.println(formatUptimeHMS(millis()));
+  oled.println(resetReasonToString(bootResetReason));
   oled.print("CPU ");
   oled.print(getCpuFrequencyMhz());
   oled.println("MHz");
@@ -779,10 +889,10 @@ void updateOledDisplay() {
 
   if ((millis() - lastOledPageChangeMsec) > OLED_PAGE_PERIOD_MSEC) {
     lastOledPageChangeMsec = millis();
-    oledPageIndex = (oledPageIndex + 1) % OLED_PAGE_COUNT;
+    oledPageIndex = (oledPageIndex + 1) % OLED_PAGE_SEQUENCE_LEN;
   }
 
-  switch (oledPageIndex) {
+  switch (OLED_PAGE_SEQUENCE[oledPageIndex]) {
     case OLED_PAGE_TEMPS:
       drawOledTempsPage();
       break;
@@ -832,20 +942,20 @@ bool connectToPreferredWifi() {
 
   if (isSsidVisible(primary.ssid)) {
     ordered[orderedCount++] = primary;
-    Serial.println(String("Preferred SSID visible: ") + primary.ssid);
+    logEvent(String("Preferred SSID visible: ") + primary.ssid);
   }
 
   if (isSsidVisible(fallback.ssid)) {
     if (orderedCount == 0) {
-      Serial.println(String("Preferred SSID not visible. Falling back to ") + fallback.ssid);
+      logEvent(String("Preferred SSID not visible. Falling back to ") + fallback.ssid);
     } else {
-      Serial.println(String("Fallback SSID also visible: ") + fallback.ssid);
+      logEvent(String("Fallback SSID also visible: ") + fallback.ssid);
     }
     ordered[orderedCount++] = fallback;
   }
 
   if (orderedCount == 0) {
-    Serial.println("No configured SSIDs visible during scan.");
+    logEvent("No configured SSIDs visible during scan.");
     ordered[orderedCount++] = primary;
     ordered[orderedCount++] = fallback;
   } else if (orderedCount == 1 && String(ordered[0].ssid) != String(primary.ssid)) {
@@ -855,8 +965,7 @@ bool connectToPreferredWifi() {
   }
 
   for (int i = 0; i < orderedCount; ++i) {
-    Serial.print("Connecting to SSID ");
-    Serial.println(ordered[i].ssid);
+    logEvent(String("Connecting to SSID ") + ordered[i].ssid);
     WiFi.disconnect(true, true);
     delay(250);
     WiFi.begin(ordered[i].ssid, ordered[i].pass);
@@ -870,19 +979,18 @@ bool connectToPreferredWifi() {
     Serial.println();
 
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.print("Connected to preferred order SSID: ");
-      Serial.println(WiFi.SSID());
+      logEvent(String("Connected to preferred order SSID: ") + WiFi.SSID());
       return true;
     }
 
-    Serial.print("Failed to connect to ");
-    Serial.println(ordered[i].ssid);
+    logEvent(String("Failed to connect to ") + ordered[i].ssid);
   }
 
   return false;
 }
 
 void setup() {
+  bootResetReason = esp_reset_reason();
   setCpuFrequencyMhz(CPU_FREQ_MHZ);
 
   if (STATUS_LED_PIN >= 0) {
@@ -898,45 +1006,46 @@ void setup() {
   Serial.begin(115200);
   delay(10);
 
+  logEvent("Boot reset=" + resetReasonToString(bootResetReason));
+  logEvent("CPU MHz=" + String(getCpuFrequencyMhz()));
+
   esp_bt_controller_disable();
   esp_bt_mem_release(ESP_BT_MODE_BTDM);
+  logEvent("Bluetooth disabled");
 
   initOledDisplay();
 
   WiFi.setHostname(NETWORK_HOSTNAME);
   if (connectToPreferredWifi()) {
-    Serial.println("WiFi connected.");
-    Serial.print("CPU MHz: ");
-    Serial.println(getCpuFrequencyMhz());
-    Serial.println(WiFi.localIP());
-    Serial.println(WiFi.SSID());
-    Serial.println(WiFi.RSSI());
+    logEvent("WiFi connected ssid=" + WiFi.SSID() + " ip=" + WiFi.localIP().toString() + " rssi=" + String(WiFi.RSSI()));
   } else {
-    Serial.println("WiFi connection failed for both configured SSIDs.");
+    logEvent("WiFi connection failed for both configured SSIDs");
   }
 
   int mDNSStatus = MDNS.begin(NETWORK_HOSTNAME);
   if (!mDNSStatus) {
-    Serial.println("Error starting mDNS");
+    logEvent("Error starting mDNS");
   } else {
-    Serial.println(String("mDNS OK ") + String(NETWORK_HOSTNAME));
+    logEvent(String("mDNS OK ") + String(NETWORK_HOSTNAME));
   }
 
   server.begin();
+  logEvent("HTTP server listening on port 80");
 
-  if (BOOSH_HAS_RTC_WDT) {
-    rtc_wdt_protect_off();
-    rtc_wdt_disable();
-  }
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL);
+  logEvent("Task WDT enabled timeout=" + String(WDT_TIMEOUT) + "s");
 
   myTimerBPMPulseBoosh = timerBegin(0, 80, true);
   timerAttachInterrupt(myTimerBPMPulseBoosh, &IRQdoADCMeasurement, false);
   timerAlarmWrite(myTimerBPMPulseBoosh, timerPeriodADCISRMeasuSec, true);
   timerAlarmEnable(myTimerBPMPulseBoosh);
+  logEvent("ADC timer armed periodSec=" + String(timerPeriodADCISRMeasuSec / 1000000.0F, 3));
 }
 
 void loop() {
   currentMillis = millis();
+  esp_task_wdt_reset();
 
   serial0DebugCom();
   serviceWebInterface();
@@ -947,14 +1056,31 @@ void loop() {
     displayDiagnosticUpdate();
   }
 
+  if (flagNeedToSampleADC) {
+    noInterrupts();
+    flagNeedToSampleADC = 0;
+    interrupts();
+
+    lastADCMeasurementTimeMsec = millis();
+    Vo = 0;
+    for (int i = 0; i < THERMISTOR_COUNT; ++i) {
+      adcRawReads[i] = 0;
+      for (int j = 0; j < THERMISTOR_MEAS_AVG_COUNT; ++j) {
+        adcRawReads[i] += analogRead(ThermistorPins[i]);
+        delayMicroseconds(THERMISTOR_MEAS_AVG_DELAY_USEC);
+      }
+      adcRawReads[i] = adcRawReads[i] >> THERMISTOR_MEAS_AVG_RIGHT_BIT_SHIFT;
+    }
+
+    flagNeedToCalculateNewTempMeasurement = 1;
+  }
+
   if (flagNeedToCalculateNewTempMeasurement) {
     int rawSnapshot[THERMISTOR_COUNT];
-    noInterrupts();
     for (int i = 0; i < THERMISTOR_COUNT; ++i) {
       rawSnapshot[i] = adcRawReads[i];
     }
     flagNeedToCalculateNewTempMeasurement = 0;
-    interrupts();
 
     for (int i = 0; i < THERMISTOR_COUNT; ++i) {
       Vo = rawSnapshot[i];
@@ -971,7 +1097,15 @@ void loop() {
         }
       }
     }
+    bool tempsValid = isfinite(T[0]) && isfinite(T[1]);
+    if (tempsValid && !lastTempsWereValid) {
+      logEvent("Temperature sampling valid t0=" + formatFloat1(T[0]) + "F t1=" + formatFloat1(T[1]) + "F");
+    } else if (!tempsValid && lastTempsWereValid) {
+      logEvent("Temperature sampling invalid adc0=" + String(adcRawReads[0]) + " adc1=" + String(adcRawReads[1]));
+    }
+    lastTempsWereValid = tempsValid;
     appendTemperatureHistory(T[0], T[1], millis());
+    flagNeedToPostNewTempMeasurement = 1;
   }
 
   bool shouldRefreshMdns = (lastmDNSLookupTimeStampMSec == 0) ||
@@ -981,28 +1115,29 @@ void loop() {
   if (shouldRefreshMdns) {
     lastmDNSLookupTimeStampMSec = millis();
     DJBOOSHBOXIp = resolve_mdns_host(TARGET_HOSTNAME);
-    Serial.println("in mDNSLookupTimeIntervalMSec...");
 
     if ((DJBOOSHBOXIp != IPAddress(1, 1, 1, 1)) && (DJBOOSHBOXIp != IPAddress(1, 1, 1, 2)) && (DJBOOSHBOXIp != IPAddress(1, 1, 1, 3))) {
       lastDJBOOSHBOXIp = DJBOOSHBOXIp;
       urlBase = String("http://") + DJBOOSHBOXIp.toString();
-      Serial.print("mDNS lookup GOOD, URL=");
-      Serial.println(urlBase);
+      logEvent("mDNS GOOD ip=" + DJBOOSHBOXIp.toString() + " url=" + urlBase);
     } else {
       if ((lastDJBOOSHBOXIp != IPAddress(1, 1, 1, 1)) && (lastDJBOOSHBOXIp != IPAddress(1, 1, 1, 2)) && (lastDJBOOSHBOXIp != IPAddress(1, 1, 1, 3))) {
         urlBase = String("http://") + lastDJBOOSHBOXIp.toString();
-        Serial.print("mDNS lookup BAD revert to cached IP, URL=");
-        Serial.println(urlBase);
+        logEvent("mDNS BAD revert cached ip=" + lastDJBOOSHBOXIp.toString() + " url=" + urlBase);
       } else {
         urlBase = String("http://") + String(TARGET_HOSTNAME) + String(".local");
-        Serial.print("mDNS lookup BAD, revert to hostname, URL=");
-        Serial.println(urlBase);
+        logEvent("mDNS BAD revert hostname url=" + urlBase);
       }
     }
-    Serial.println("DONE mDNSLookupTimeIntervalMSec...");
   }
 
   if (flagNeedToPostNewTempMeasurement && ((millis() - lastHttpPostTimeMSec) > lastHttpPostIntervalMSec)) {
+    if (!isfinite(T[0]) || !isfinite(T[1])) {
+      logEvent("Skip HTTP post until both temperatures are valid");
+      flagNeedToPostNewTempMeasurement = 0;
+      return;
+    }
+
     serverPath = urlBase + "/updatetemp?";
     for (int i = 0; i < THERMISTOR_COUNT; ++i) {
       serverPath += "t";
@@ -1024,8 +1159,10 @@ void loop() {
 
     if (httpResponseCode > 0) {
       lastHttpReponseGoodTimestampMsec = millis();
+      logHttpEvent("HTTP GET", httpResponseCode, "OK");
     } else {
       lastHttpReponseBadTimestampMsec = millis();
+      logHttpEvent("HTTP GET", httpResponseCode, "FAIL");
     }
 
     flagNeedToPostNewTempMeasurement = 0;
@@ -1072,6 +1209,8 @@ void serviceWebInterface() {
     sendHttpResponse(client, "application/json; charset=utf-8", buildStatusJson(true));
   } else if (routePath == "/api/history") {
     sendHttpResponse(client, "application/json; charset=utf-8", buildHistoryJson());
+  } else if (routePath == "/api/logs") {
+    sendHttpResponse(client, "application/json; charset=utf-8", buildLogJson());
   } else if (routePath == "/H") {
     if (STATUS_LED_PIN >= 0) {
       digitalWrite(STATUS_LED_PIN, HIGH);

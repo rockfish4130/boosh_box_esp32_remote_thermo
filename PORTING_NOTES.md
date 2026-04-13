@@ -33,3 +33,11 @@ This project was developed as an Arduino IDE sketch for a `WEMOS LOLIN32` and ha
 - Bluetooth is disabled and controller memory is released.
 - Periodic mDNS refresh is reduced to boot, every 15 minutes, or shortly after an HTTP failure instead of constant 1-minute refresh.
 - In bench testing after these changes, observed current draw dropped to roughly `60 mA` average or lower at about `3.7 V`.
+
+## Stability And Diagnostics Notes
+
+- ADC sampling no longer runs inside the hardware timer ISR. The ISR is now flag-only, and the actual `analogRead()` averaging runs in `loop()`. This avoids starving Wi-Fi/network work in interrupt context.
+- A task watchdog is enabled again so the board can recover from lockups instead of freezing indefinitely with a static OLED screen.
+- Invalid or not-yet-ready temperature values are represented as `--F` on the OLED and as `null` in the JSON API instead of misleading `0F`.
+- The OLED page rotation is weighted so the temperature page is shown about 70% of the time.
+- The web dashboard now includes a `pylons`-style Serial Console backed by `/api/logs`, with recent boot, Wi-Fi, mDNS, HTTP, reset-reason, and temperature-validity events.
