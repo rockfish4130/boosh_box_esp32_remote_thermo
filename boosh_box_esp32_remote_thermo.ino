@@ -16,6 +16,9 @@ Yellow Blue Display with ESP32-N4XX module
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
 #include <math.h>
 
 #if __has_include("soc/rtc_wdt.h")
@@ -63,6 +66,12 @@ Yellow Blue Display with ESP32-N4XX module
 #define DEBUG_DISPLAY_DIAGNOSTIC_UPDATE_PERIOD_MSEC 500
 #define NETWORK_HOSTNAME "REMOTETHERMO"
 #define TARGET_HOSTNAME "RPIBOOSH"
+#define AP_SSID "FIRE_REMOTETHERMO"
+#define AP_IP IPAddress(10, 1, 2, 3)
+constexpr const char *kPrefsNamespace = "rthermo_cfg";
+constexpr const char *kPrefsKeyAp     = "ap_en";
+constexpr const char *kPrefsKeyUserSsid = "usr_ssid";
+constexpr const char *kPrefsKeyUserPass = "usr_pass";
 #define WIFI_CONNECTION_TIMEOUT_SECS 30
 #define CPU_FREQ_MHZ 80
 
@@ -101,7 +110,13 @@ const uint8_t OLED_PAGE_SEQUENCE[] = {
 const int OLED_PAGE_SEQUENCE_LEN = sizeof(OLED_PAGE_SEQUENCE) / sizeof(OLED_PAGE_SEQUENCE[0]);
 
 hw_timer_t *myTimerBPMPulseBoosh = NULL;
-WiFiServer server(80);
+WebServer webServer(80);
+DNSServer dnsServer;
+bool ap_enabled = false;
+bool ap_active = false;
+bool webServerStarted = false;
+String user_wifi_ssid;
+String user_wifi_pass;
 HTTPClient http;
 Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
@@ -153,7 +168,21 @@ unsigned long lastOledPageChangeMsec = 0;
 int oledPageIndex = OLED_PAGE_TEMPS;
 
 IPAddress resolve_mdns_host(const char *host_name);
-void serviceWebInterface();
+void loadConfig();
+void saveConfig();
+String buildConfigApiJson();
+void sendApiError(int code, const char *msg);
+void handleWebRoot();
+void handleApiStatus();
+void handleApiHistory();
+void handleApiLogs();
+void handleApiConfigGet();
+void handleApiConfigPost();
+void handleApiConfigAp();
+void handleCaptivePortalRedirect();
+void setupWebServer();
+void setupApMode();
+void stopApMode();
 void serial0DebugCom();
 void displayDiagnosticUpdate();
 void updateOledDisplay();
@@ -234,6 +263,48 @@ String htmlEscape(const String &input) {
     }
   }
   return out;
+}
+
+void loadConfig() {
+  Preferences prefs;
+  if (!prefs.begin(kPrefsNamespace, true)) {
+    logEvent("[CFG] NVS open failed — using defaults");
+    return;
+  }
+  ap_enabled      = prefs.getBool(kPrefsKeyAp, false);
+  user_wifi_ssid  = prefs.getString(kPrefsKeyUserSsid, "");
+  user_wifi_pass  = prefs.getString(kPrefsKeyUserPass, "");
+  prefs.end();
+  logEvent("[CFG] loaded ap_en=" + String(ap_enabled ? "true" : "false") +
+           " usr_ssid=" + (user_wifi_ssid.length() > 0 ? user_wifi_ssid : "(none)"));
+}
+
+void saveConfig() {
+  Preferences prefs;
+  if (!prefs.begin(kPrefsNamespace, false)) {
+    logEvent("[CFG] NVS write open failed");
+    return;
+  }
+  prefs.putBool(kPrefsKeyAp, ap_enabled);
+  prefs.putString(kPrefsKeyUserSsid, user_wifi_ssid);
+  prefs.putString(kPrefsKeyUserPass, user_wifi_pass);
+  prefs.end();
+}
+
+String buildConfigApiJson() {
+  String j;
+  j.reserve(128);
+  j += "{";
+  j += "\"ap_enabled\":" + String(ap_enabled ? "true" : "false") + ",";
+  j += "\"ap_active\":"  + String(ap_active  ? "true" : "false") + ",";
+  j += "\"wifi_ssid\":\"" + jsonEscape(user_wifi_ssid) + "\"";
+  j += "}";
+  return j;
+}
+
+void sendApiError(int code, const char *msg) {
+  webServer.send(code, "application/json; charset=utf-8",
+                 String("{\"ok\":false,\"error\":\"") + msg + "\"}");
 }
 
 String wifiEncryptionToString(wifi_auth_mode_t mode) {
@@ -671,7 +742,7 @@ String buildDashboardHtml() {
   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<title>REMOTETHERMO Dashboard</title>";
   html += "<style>";
-  html += ":root{--bg:#0b0f14;--panel:#131a23;--panel2:#192230;--text:#edf3fb;--muted:#9aacbf;--accent:#ff8b6b;--accent2:#7ce3b0;--border:#263244;}";
+  html += ":root{--bg:#0b0f14;--panel:#131a23;--panel2:#192230;--text:#edf3fb;--muted:#9aacbf;--accent:#ff8b6b;--accent2:#7ce3b0;--border:#263244;--line:#263244;}";
   html += "body{margin:0;font-family:Verdana,Arial,sans-serif;background:radial-gradient(circle at top,#1b2432 0,#0b0f14 50%);color:var(--text);}";
   html += ".wrap{max-width:1100px;margin:0 auto;padding:20px;}";
   html += ".hero{background:linear-gradient(135deg,#141c27,#0f141c);border:1px solid var(--border);border-radius:18px;padding:18px 20px;box-shadow:0 10px 40px rgba(0,0,0,0.28);}";
@@ -711,6 +782,7 @@ String buildDashboardHtml() {
   html += "<span class='chip'>HTTP " + String(httpResponseCode) + "</span>";
   html += "<span class='chip'>ST " + String(shortTermHistoryCount) + "/" + String(SHORT_TERM_HISTORY_CAPACITY) + " (3s)</span>";
   html += "<span class='chip'>LT " + String(tempHistoryCount) + "/" + String(TEMP_HISTORY_CAPACITY) + " (2min)</span>";
+  html += "<span class='chip'>AP " + String(ap_active ? "active" : "off") + "</span>";
   html += "</div></section>";
 
   html += "<div class='grid'>";
@@ -773,6 +845,23 @@ String buildDashboardHtml() {
     }
   }
   html += "</pre></div></section>";
+
+  html += "<section class='panel'><h2>Node Config</h2>";
+  html += "<form id='config-form'>";
+  html += "<div style='border-top:1px solid var(--border);padding-top:10px;display:grid;gap:8px'>";
+  html += "<span style='color:var(--muted);font-size:13px'>WiFi Fallback</span>";
+  html += "<div class='kv'><div class='k'>SSID</div><div class='v'><input id='cfg-wifi-ssid' style='width:100%;box-sizing:border-box;background:#0d141d;color:#f3f7fd;border:1px solid var(--border);border-radius:6px;padding:6px 8px;font-size:13px' placeholder='leave blank to disable'></div></div>";
+  html += "<div class='kv'><div class='k'>Password</div><div class='v'><input id='cfg-wifi-pass' type='password' style='width:100%;box-sizing:border-box;background:#0d141d;color:#f3f7fd;border:1px solid var(--border);border-radius:6px;padding:6px 8px;font-size:13px' placeholder=''></div></div>";
+  html += "</div>";
+  html += "<div style='border-top:1px solid var(--border);padding-top:10px;display:flex;align-items:center;gap:10px'>";
+  html += "<input type='checkbox' id='cfg-ap' style='width:18px;height:18px;margin:0;cursor:pointer;accent-color:var(--accent)'>";
+  html += "<span style='color:var(--muted);font-size:14px'>Enable WiFi AP &mdash; SSID: <code>" + String(AP_SSID) + "</code>, IP <code>10.1.2.3</code></span>";
+  html += "</div>";
+  html += "<div style='display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px'>";
+  html += "<button type='submit' style='padding:8px 16px;background:var(--accent);color:#0b0f14;border:none;border-radius:8px;font-size:14px;cursor:pointer;font-weight:bold'>Save Config</button>";
+  html += "<span id='config-status' style='font-size:13px;color:var(--muted)'></span>";
+  html += "</div>";
+  html += "</form></section>";
   html += "</div>";
 
   html += "<section class='graph-wrap'><h2>T0 / T1 Temperature History</h2>";
@@ -785,26 +874,18 @@ String buildDashboardHtml() {
   html += "</section>";
 
   html += "<script>";
-  html += "async function fetchJson(url){const res=await fetch(url,{cache:'no-store'});if(!res.ok) throw new Error(await res.text());return res.json();}";
-  html += "async function refreshLogs(){const data=await fetchJson('/api/logs');const text=document.getElementById('log-text');const box=document.getElementById('log');if(text&&box){text.textContent=data.log||'';box.scrollTop=box.scrollHeight;}}";
+  html += "async function fetchJson(url,opt){const r=await fetch(url,Object.assign({cache:'no-store'},opt));if(!r.ok)throw new Error(await r.text());return r.json();}";
+  html += "function syncField(id,v){const e=document.getElementById(id);if(e&&document.activeElement!==e)e.value=v||'';}";
+  html += "async function refreshLogs(){const d=await fetchJson('/api/logs');const t=document.getElementById('log-text');const b=document.getElementById('log');if(t&&b){t.textContent=d.log||'';b.scrollTop=b.scrollHeight;}}";
+  html += "async function refreshConfig(){const d=await fetchJson('/api/config');syncField('cfg-wifi-ssid',d.wifi_ssid);const cb=document.getElementById('cfg-ap');if(cb&&document.activeElement!==cb)cb.checked=!!d.ap_enabled;}";
+  html += "document.getElementById('cfg-ap').addEventListener('change',async(e)=>{await fetchJson('/api/config/ap',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'value='+(e.target.checked?'true':'false')});});";
+  html += "document.getElementById('config-form').addEventListener('submit',async(e)=>{e.preventDefault();const st=document.getElementById('config-status');st.textContent='Saving...';const b=new URLSearchParams();const s=document.getElementById('cfg-wifi-ssid').value.trim();if(s)b.set('wifi_ssid',s);else b.set('wifi_ssid','');const p=document.getElementById('cfg-wifi-pass').value;if(p)b.set('wifi_pass',p);try{await fetchJson('/api/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b.toString()});st.textContent='Saved';document.getElementById('cfg-wifi-pass').value='';}catch(err){st.textContent='Error: '+err.message;}});";
   html += "setInterval(()=>{refreshLogs().catch(()=>{});},3000);";
-  html += "refreshLogs().catch(()=>{});";
+  html += "setInterval(()=>{refreshConfig().catch(()=>{});},5000);";
+  html += "refreshLogs().catch(()=>{});refreshConfig().catch(()=>{});";
   html += "</script>";
   html += "</div></body></html>";
   return html;
-}
-
-void sendHttpResponse(WiFiClient &client, const char *contentType, const String &body, int code = 200, const char *statusText = "OK") {
-  client.printf("HTTP/1.1 %d %s\r\n", code, statusText);
-  client.printf("Content-Type: %s\r\n", contentType);
-  client.println("Cache-Control: no-store");
-  client.printf("Content-Length: %u\r\n", (unsigned int)body.length());
-  client.println("Connection: close");
-  client.println();
-  // Large bodies (dashboard HTML with SVG) can take several seconds to drain
-  // through the WiFi TCP stack — reset WDT so the send doesn't trigger it.
-  esp_task_wdt_reset();
-  client.print(body);
 }
 
 void IRAM_ATTR IRQdoADCMeasurement() {
@@ -1005,8 +1086,141 @@ bool connectToPreferredWifi() {
     logEvent(String("Failed to connect to ") + ordered[i].ssid);
   }
 
+  // User-defined WiFi fallback (stored in NVS)
+  if (user_wifi_ssid.length() > 0) {
+    logEvent("Trying user WiFi fallback ssid=" + user_wifi_ssid);
+    WiFi.disconnect(true, true);
+    delay(250);
+    WiFi.begin(user_wifi_ssid.c_str(), user_wifi_pass.c_str());
+    int attempts = 0;
+    while ((WiFi.status() != WL_CONNECTED) && (attempts < (WIFI_CONNECTION_TIMEOUT_SECS * 2))) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      logEvent("Connected to user WiFi ssid=" + WiFi.SSID());
+      return true;
+    }
+    logEvent("Failed to connect to user WiFi ssid=" + user_wifi_ssid);
+  }
+
   return false;
 }
+
+// ── Web handlers ─────────────────────────────────────────────────────────────
+
+void handleWebRoot() {
+  esp_task_wdt_reset();
+  webServer.send(200, "text/html; charset=utf-8", buildDashboardHtml());
+}
+
+void handleApiStatus() {
+  esp_task_wdt_reset();
+  webServer.send(200, "application/json; charset=utf-8", buildStatusJson(true));
+}
+
+void handleApiHistory() {
+  webServer.send(200, "application/json; charset=utf-8", buildHistoryJson());
+}
+
+void handleApiLogs() {
+  webServer.send(200, "application/json; charset=utf-8", buildLogJson());
+}
+
+void handleApiConfigGet() {
+  webServer.send(200, "application/json; charset=utf-8", buildConfigApiJson());
+}
+
+void handleApiConfigPost() {
+  bool changed = false;
+  if (webServer.hasArg("wifi_ssid")) {
+    user_wifi_ssid = webServer.arg("wifi_ssid");
+    user_wifi_ssid.trim();
+    changed = true;
+    logEvent("[CFG] wifi_ssid set: " + (user_wifi_ssid.length() > 0 ? user_wifi_ssid : "(cleared)"));
+  }
+  if (webServer.hasArg("wifi_pass") && webServer.arg("wifi_pass").length() > 0) {
+    user_wifi_pass = webServer.arg("wifi_pass");
+    changed = true;
+    logEvent("[CFG] wifi_pass updated");
+  }
+  if (!changed) {
+    sendApiError(400, "expected wifi_ssid and/or wifi_pass");
+    return;
+  }
+  saveConfig();
+  webServer.send(200, "application/json; charset=utf-8",
+                 "{\"ok\":true,\"config\":" + buildConfigApiJson() + "}");
+}
+
+void handleApiConfigAp() {
+  if (!webServer.hasArg("value")) {
+    sendApiError(400, "missing value");
+    return;
+  }
+  String v = webServer.arg("value");
+  v.toLowerCase();
+  ap_enabled = (v == "true" || v == "1" || v == "yes" || v == "on");
+  saveConfig();
+  logEvent("[CFG] ap_enabled=" + String(ap_enabled ? "true" : "false"));
+  webServer.send(200, "application/json; charset=utf-8",
+                 "{\"ok\":true,\"config\":" + buildConfigApiJson() + "}");
+}
+
+void handleCaptivePortalRedirect() {
+  webServer.sendHeader("Location", "http://10.1.2.3/");
+  webServer.sendHeader("Cache-Control", "no-cache");
+  webServer.send(302, "text/plain", "");
+}
+
+void setupWebServer() {
+  if (webServerStarted) return;
+  webServer.on("/",            HTTP_GET,  handleWebRoot);
+  webServer.on("/api/status",  HTTP_GET,  handleApiStatus);
+  webServer.on("/api/history", HTTP_GET,  handleApiHistory);
+  webServer.on("/api/logs",    HTTP_GET,  handleApiLogs);
+  webServer.on("/api/config",  HTTP_GET,  handleApiConfigGet);
+  webServer.on("/api/config",  HTTP_POST, handleApiConfigPost);
+  webServer.on("/api/config/ap", HTTP_POST, handleApiConfigAp);
+  webServer.begin();
+  webServerStarted = true;
+  logEvent("HTTP server listening on port 80");
+}
+
+void setupApMode() {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    WiFi.mode(WIFI_AP);
+  }
+  WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(AP_SSID);
+  delay(100);
+  dnsServer.start(53, "*", AP_IP);
+  ap_active = true;
+  logEvent(String("[AP] started SSID: ") + AP_SSID + " IP: 10.1.2.3");
+  setupWebServer();
+  // Captive portal detection probes for iOS / Android / Windows
+  webServer.on("/generate_204",       HTTP_GET, handleCaptivePortalRedirect);
+  webServer.on("/hotspot-detect.html",HTTP_GET, handleCaptivePortalRedirect);
+  webServer.on("/ncsi.txt",           HTTP_GET, handleCaptivePortalRedirect);
+  webServer.on("/connecttest.txt",    HTTP_GET, handleCaptivePortalRedirect);
+  webServer.onNotFound(handleCaptivePortalRedirect);
+}
+
+void stopApMode() {
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.mode(WIFI_STA);
+  }
+  ap_active = false;
+  logEvent("[AP] stopped");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 void setup() {
   bootResetReason = esp_reset_reason();
@@ -1028,6 +1242,8 @@ void setup() {
   logEvent("Boot reset=" + resetReasonToString(bootResetReason));
   logEvent("CPU MHz=" + String(getCpuFrequencyMhz()));
 
+  loadConfig();
+
   esp_bt_controller_disable();
   esp_bt_mem_release(ESP_BT_MODE_BTDM);
   logEvent("Bluetooth disabled");
@@ -1038,7 +1254,12 @@ void setup() {
   if (connectToPreferredWifi()) {
     logEvent("WiFi connected ssid=" + WiFi.SSID() + " ip=" + WiFi.localIP().toString() + " rssi=" + String(WiFi.RSSI()));
   } else {
-    logEvent("WiFi connection failed for both configured SSIDs");
+    logEvent("WiFi connection failed");
+    if (!ap_enabled) {
+      ap_enabled = true;
+      saveConfig();
+      logEvent("[AP] auto-enabled: no WiFi network found");
+    }
   }
 
   int mDNSStatus = MDNS.begin(NETWORK_HOSTNAME);
@@ -1048,8 +1269,11 @@ void setup() {
     logEvent(String("mDNS OK ") + String(NETWORK_HOSTNAME));
   }
 
-  server.begin();
-  logEvent("HTTP server listening on port 80");
+  setupWebServer();
+
+  if (ap_enabled) {
+    setupApMode();
+  }
 
   esp_task_wdt_init(WDT_TIMEOUT, true);
   esp_task_wdt_add(NULL);
@@ -1067,7 +1291,10 @@ void loop() {
   esp_task_wdt_reset();
 
   serial0DebugCom();
-  serviceWebInterface();
+  webServer.handleClient();
+  if (ap_active) dnsServer.processNextRequest();
+  if (ap_enabled && !ap_active) setupApMode();
+  else if (!ap_enabled && ap_active) stopApMode();
   updateOledDisplay();
 
   if (((currentMillis - lastDisplayDiagnosticSerialDumpTimeMsec) > DEBUG_DISPLAY_DIAGNOSTIC_UPDATE_PERIOD_MSEC) ||
@@ -1188,68 +1415,6 @@ void loop() {
 
     flagNeedToPostNewTempMeasurement = 0;
   }
-}
-
-void serviceWebInterface() {
-  WiFiClient client = server.available();
-  if (!client) {
-    return;
-  }
-
-  Serial.println("New Client.");
-  client.setTimeout(1000);
-
-  String requestLine = client.readStringUntil('\r');
-  client.readStringUntil('\n');
-
-  while (client.connected()) {
-    String headerLine = client.readStringUntil('\n');
-    if (headerLine == "\r" || headerLine.length() <= 1) {
-      break;
-    }
-  }
-
-  String path = "/";
-  int firstSpace = requestLine.indexOf(' ');
-  if (firstSpace >= 0) {
-    int secondSpace = requestLine.indexOf(' ', firstSpace + 1);
-    if (secondSpace > firstSpace) {
-      path = requestLine.substring(firstSpace + 1, secondSpace);
-    }
-  }
-
-  int queryPos = path.indexOf('?');
-  String routePath = path;
-  if (queryPos >= 0) {
-    routePath = path.substring(0, queryPos);
-  }
-
-  esp_task_wdt_reset();
-
-  if (routePath == "/") {
-    sendHttpResponse(client, "text/html; charset=utf-8", buildDashboardHtml());
-  } else if (routePath == "/api/status") {
-    sendHttpResponse(client, "application/json; charset=utf-8", buildStatusJson(true));
-  } else if (routePath == "/api/history") {
-    sendHttpResponse(client, "application/json; charset=utf-8", buildHistoryJson());
-  } else if (routePath == "/api/logs") {
-    sendHttpResponse(client, "application/json; charset=utf-8", buildLogJson());
-  } else if (routePath == "/H") {
-    if (STATUS_LED_PIN >= 0) {
-      digitalWrite(STATUS_LED_PIN, HIGH);
-    }
-    sendHttpResponse(client, "application/json; charset=utf-8", "{\"ok\":true,\"led\":\"on\"}");
-  } else if (routePath == "/L") {
-    if (STATUS_LED_PIN >= 0) {
-      digitalWrite(STATUS_LED_PIN, LOW);
-    }
-    sendHttpResponse(client, "application/json; charset=utf-8", "{\"ok\":true,\"led\":\"off\"}");
-  } else {
-    sendHttpResponse(client, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"not found\"}", 404, "Not Found");
-  }
-
-  client.stop();
-  Serial.println("Client Disconnected.");
 }
 
 void serial0DebugCom() {
