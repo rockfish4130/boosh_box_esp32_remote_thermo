@@ -75,6 +75,7 @@ Yellow Blue Display with ESP32-N4XX module
 #define TEMP_HISTORY_DAYS 5
 #define TEMP_HISTORY_CAPACITY ((TEMP_HISTORY_DAYS * 24UL * 60UL * 60UL * 1000UL) / TEMP_HISTORY_SAMPLE_PERIOD_MSEC)
 #define TEMP_HISTORY_API_MAX_POINTS 480
+#define SHORT_TERM_HISTORY_CAPACITY 600
 #define OLED_PAGE_PERIOD_MSEC 3500UL
 #define LOG_LINE_MAX_LEN 120
 #define LOG_LINE_COUNT 96
@@ -138,6 +139,9 @@ TempHistoryPoint tempHistory[TEMP_HISTORY_CAPACITY];
 int tempHistoryCount = 0;
 int tempHistoryNextIndex = 0;
 unsigned long lastTempHistoryStoreMillis = 0;
+TempHistoryPoint shortTermHistory[SHORT_TERM_HISTORY_CAPACITY];
+int shortTermHistoryCount = 0;
+int shortTermHistoryNextIndex = 0;
 String logLines[LOG_LINE_COUNT];
 int logLineNextIndex = 0;
 int logLineCount = 0;
@@ -155,15 +159,17 @@ void displayDiagnosticUpdate();
 void updateOledDisplay();
 void initOledDisplay();
 void appendTemperatureHistory(float t0, float t1, unsigned long stampMillis);
-int getSampledHistoryIndices(int *indices, int maxPoints);
-int getSampledHistoryIndicesForLookback(int *indices, int maxPoints, unsigned long lookbackMs);
+float bufferMinTemp(TempHistoryPoint *buf, int bufCapacity, int bufCount, int bufNextIndex);
+float bufferMaxTemp(TempHistoryPoint *buf, int bufCapacity, int bufCount, int bufNextIndex);
+int getSampledBufferIndices(TempHistoryPoint *buf, int bufCapacity, int bufCount, int bufNextIndex, int *indices, int maxPoints);
+int getSampledBufferIndicesForLookback(TempHistoryPoint *buf, int bufCapacity, int bufCount, int bufNextIndex, int *indices, int maxPoints, unsigned long lookbackMs);
 bool isSsidVisible(const char *ssid);
 bool connectToPreferredWifi();
 String buildDashboardHtml();
 String buildStatusJson(bool includeHistory);
 String buildHistoryJson();
 String buildLogJson();
-String buildTemperaturePlotSvg(unsigned long lookbackMs, const char *emptyLabel, const char *timeAxisLabel);
+String buildTemperaturePlotSvg(TempHistoryPoint *buf, int bufCapacity, int bufCount, int bufNextIndex, const char *emptyLabel, const char *timeAxisLabel);
 String formatUptimeHMS(unsigned long ms);
 String formatAgeSeconds(unsigned long sinceMillis);
 String formatTempDisplay(float value);
@@ -322,77 +328,86 @@ String formatAgeSeconds(unsigned long sinceMillis) {
   return String(delta / 1000.0F, 1) + " s";
 }
 
-float historyMinTemp() {
+float bufferMinTemp(TempHistoryPoint *buf, int bufCapacity, int bufCount, int bufNextIndex) {
   float minValue = 99999.0F;
-  for (int i = 0; i < tempHistoryCount; ++i) {
-    int idx = (tempHistoryNextIndex - tempHistoryCount + i + TEMP_HISTORY_CAPACITY) % TEMP_HISTORY_CAPACITY;
-    minValue = min(minValue, min(tempHistory[idx].t0, tempHistory[idx].t1));
+  for (int i = 0; i < bufCount; ++i) {
+    int idx = (bufNextIndex - bufCount + i + bufCapacity) % bufCapacity;
+    minValue = min(minValue, min(buf[idx].t0, buf[idx].t1));
   }
-  return (tempHistoryCount > 0) ? minValue : 0.0F;
+  return (bufCount > 0) ? minValue : 0.0F;
 }
 
-float historyMaxTemp() {
+float bufferMaxTemp(TempHistoryPoint *buf, int bufCapacity, int bufCount, int bufNextIndex) {
   float maxValue = -99999.0F;
-  for (int i = 0; i < tempHistoryCount; ++i) {
-    int idx = (tempHistoryNextIndex - tempHistoryCount + i + TEMP_HISTORY_CAPACITY) % TEMP_HISTORY_CAPACITY;
-    maxValue = max(maxValue, max(tempHistory[idx].t0, tempHistory[idx].t1));
+  for (int i = 0; i < bufCount; ++i) {
+    int idx = (bufNextIndex - bufCount + i + bufCapacity) % bufCapacity;
+    maxValue = max(maxValue, max(buf[idx].t0, buf[idx].t1));
   }
-  return (tempHistoryCount > 0) ? maxValue : 1.0F;
+  return (bufCount > 0) ? maxValue : 1.0F;
 }
 
 void appendTemperatureHistory(float t0, float t1, unsigned long stampMillis) {
   if (!isfinite(t0) || !isfinite(t1)) {
     return;
   }
-  if ((tempHistoryCount > 0) && ((stampMillis - lastTempHistoryStoreMillis) < TEMP_HISTORY_SAMPLE_PERIOD_MSEC)) {
-    return;
+  // Short-term buffer: every ADC sample, ring wraps at 600 points = 30 min at 3 s
+  shortTermHistory[shortTermHistoryNextIndex].millisStamp = stampMillis;
+  shortTermHistory[shortTermHistoryNextIndex].t0 = t0;
+  shortTermHistory[shortTermHistoryNextIndex].t1 = t1;
+  shortTermHistoryNextIndex = (shortTermHistoryNextIndex + 1) % SHORT_TERM_HISTORY_CAPACITY;
+  if (shortTermHistoryCount < SHORT_TERM_HISTORY_CAPACITY) {
+    shortTermHistoryCount++;
   }
-  tempHistory[tempHistoryNextIndex].millisStamp = stampMillis;
-  tempHistory[tempHistoryNextIndex].t0 = t0;
-  tempHistory[tempHistoryNextIndex].t1 = t1;
-  lastTempHistoryStoreMillis = stampMillis;
-  tempHistoryNextIndex = (tempHistoryNextIndex + 1) % TEMP_HISTORY_CAPACITY;
-  if (tempHistoryCount < TEMP_HISTORY_CAPACITY) {
-    tempHistoryCount++;
+  // Long-term buffer: one point per 2 minutes, ~5-day retention
+  if ((tempHistoryCount == 0) || ((stampMillis - lastTempHistoryStoreMillis) >= TEMP_HISTORY_SAMPLE_PERIOD_MSEC)) {
+    tempHistory[tempHistoryNextIndex].millisStamp = stampMillis;
+    tempHistory[tempHistoryNextIndex].t0 = t0;
+    tempHistory[tempHistoryNextIndex].t1 = t1;
+    lastTempHistoryStoreMillis = stampMillis;
+    tempHistoryNextIndex = (tempHistoryNextIndex + 1) % TEMP_HISTORY_CAPACITY;
+    if (tempHistoryCount < TEMP_HISTORY_CAPACITY) {
+      tempHistoryCount++;
+    }
   }
 }
 
-int getSampledHistoryIndices(int *indices, int maxPoints) {
-  if (tempHistoryCount <= 0 || maxPoints <= 0) {
+int getSampledBufferIndices(TempHistoryPoint *buf, int bufCapacity, int bufCount, int bufNextIndex, int *indices, int maxPoints) {
+  if (bufCount <= 0 || maxPoints <= 0) {
     return 0;
   }
 
-  int count = tempHistoryCount;
+  int count = bufCount;
   if (count <= maxPoints) {
     for (int i = 0; i < count; ++i) {
-      indices[i] = (tempHistoryNextIndex - tempHistoryCount + i + TEMP_HISTORY_CAPACITY) % TEMP_HISTORY_CAPACITY;
+      indices[i] = (bufNextIndex - bufCount + i + bufCapacity) % bufCapacity;
     }
     return count;
   }
 
   for (int i = 0; i < maxPoints; ++i) {
     int logicalIndex = (long long)i * (count - 1) / (maxPoints - 1);
-    indices[i] = (tempHistoryNextIndex - tempHistoryCount + logicalIndex + TEMP_HISTORY_CAPACITY) % TEMP_HISTORY_CAPACITY;
+    indices[i] = (bufNextIndex - bufCount + logicalIndex + bufCapacity) % bufCapacity;
   }
   return maxPoints;
 }
 
-int getSampledHistoryIndicesForLookback(int *indices, int maxPoints, unsigned long lookbackMs) {
-  if (tempHistoryCount <= 0 || maxPoints <= 0) {
+int getSampledBufferIndicesForLookback(TempHistoryPoint *buf, int bufCapacity, int bufCount, int bufNextIndex, int *indices, int maxPoints, unsigned long lookbackMs) {
+  if (bufCount <= 0 || maxPoints <= 0) {
     return 0;
   }
 
   if (lookbackMs == 0) {
-    return getSampledHistoryIndices(indices, maxPoints);
+    return getSampledBufferIndices(buf, bufCapacity, bufCount, bufNextIndex, indices, maxPoints);
   }
 
-  unsigned long cutoff = millis() - lookbackMs;
+  unsigned long nowMs = millis();
+  unsigned long cutoff = (nowMs > lookbackMs) ? (nowMs - lookbackMs) : 0UL;
   int firstLogicalIndex = -1;
   int matchingCount = 0;
 
-  for (int logicalIndex = 0; logicalIndex < tempHistoryCount; ++logicalIndex) {
-    int idx = (tempHistoryNextIndex - tempHistoryCount + logicalIndex + TEMP_HISTORY_CAPACITY) % TEMP_HISTORY_CAPACITY;
-    if (tempHistory[idx].millisStamp >= cutoff) {
+  for (int logicalIndex = 0; logicalIndex < bufCount; ++logicalIndex) {
+    int idx = (bufNextIndex - bufCount + logicalIndex + bufCapacity) % bufCapacity;
+    if (buf[idx].millisStamp >= cutoff) {
       if (firstLogicalIndex < 0) {
         firstLogicalIndex = logicalIndex;
       }
@@ -406,7 +421,7 @@ int getSampledHistoryIndicesForLookback(int *indices, int maxPoints, unsigned lo
   if (matchingCount <= maxPoints) {
     for (int i = 0; i < matchingCount; ++i) {
       int logicalIndex = firstLogicalIndex + i;
-      indices[i] = (tempHistoryNextIndex - tempHistoryCount + logicalIndex + TEMP_HISTORY_CAPACITY) % TEMP_HISTORY_CAPACITY;
+      indices[i] = (bufNextIndex - bufCount + logicalIndex + bufCapacity) % bufCapacity;
     }
     return matchingCount;
   }
@@ -414,18 +429,18 @@ int getSampledHistoryIndicesForLookback(int *indices, int maxPoints, unsigned lo
   for (int i = 0; i < maxPoints; ++i) {
     int logicalIndex = (long long)i * (matchingCount - 1) / (maxPoints - 1);
     int absoluteLogicalIndex = firstLogicalIndex + logicalIndex;
-    indices[i] = (tempHistoryNextIndex - tempHistoryCount + absoluteLogicalIndex + TEMP_HISTORY_CAPACITY) % TEMP_HISTORY_CAPACITY;
+    indices[i] = (bufNextIndex - bufCount + absoluteLogicalIndex + bufCapacity) % bufCapacity;
   }
   return maxPoints;
 }
 
-String buildTemperaturePlotSvg(unsigned long lookbackMs, const char *emptyLabel, const char *timeAxisLabel) {
-  if (tempHistoryCount < 2) {
+String buildTemperaturePlotSvg(TempHistoryPoint *buf, int bufCapacity, int bufCount, int bufNextIndex, const char *emptyLabel, const char *timeAxisLabel) {
+  if (bufCount < 2) {
     return String("<div class='empty-graph'>") + emptyLabel + "</div>";
   }
 
   int sampledIndices[TEMP_HISTORY_API_MAX_POINTS];
-  int sampledCount = getSampledHistoryIndicesForLookback(sampledIndices, TEMP_HISTORY_API_MAX_POINTS, lookbackMs);
+  int sampledCount = getSampledBufferIndices(buf, bufCapacity, bufCount, bufNextIndex, sampledIndices, TEMP_HISTORY_API_MAX_POINTS);
   if (sampledCount < 2) {
     return String("<div class='empty-graph'>") + emptyLabel + "</div>";
   }
@@ -443,13 +458,13 @@ String buildTemperaturePlotSvg(unsigned long lookbackMs, const char *emptyLabel,
   unsigned long maxTs = 0;
   for (int i = 0; i < sampledCount; ++i) {
     int idx = sampledIndices[i];
-    unsigned long ts = tempHistory[idx].millisStamp;
+    unsigned long ts = buf[idx].millisStamp;
     if (i == 0 || ts < minTs) minTs = ts;
     if (i == 0 || ts > maxTs) maxTs = ts;
   }
 
-  float minTemp = historyMinTemp();
-  float maxTemp = historyMaxTemp();
+  float minTemp = bufferMinTemp(buf, bufCapacity, bufCount, bufNextIndex);
+  float maxTemp = bufferMaxTemp(buf, bufCapacity, bufCount, bufNextIndex);
   if (maxTs <= minTs) {
     maxTs = minTs + 1UL;
   }
@@ -464,9 +479,9 @@ String buildTemperaturePlotSvg(unsigned long lookbackMs, const char *emptyLabel,
 
   for (int i = 0; i < sampledCount; ++i) {
     int idx = sampledIndices[i];
-    float x = leftPad + ((float)(tempHistory[idx].millisStamp - minTs) / (float)(maxTs - minTs)) * innerWidth;
-    float y0 = topPad + (1.0F - ((tempHistory[idx].t0 - minTemp) / (maxTemp - minTemp))) * innerHeight;
-    float y1 = topPad + (1.0F - ((tempHistory[idx].t1 - minTemp) / (maxTemp - minTemp))) * innerHeight;
+    float x = leftPad + ((float)(buf[idx].millisStamp - minTs) / (float)(maxTs - minTs)) * innerWidth;
+    float y0 = topPad + (1.0F - ((buf[idx].t0 - minTemp) / (maxTemp - minTemp))) * innerHeight;
+    float y1 = topPad + (1.0F - ((buf[idx].t1 - minTemp) / (maxTemp - minTemp))) * innerHeight;
     if (i > 0) {
       t0Points += " ";
       t1Points += " ";
@@ -514,7 +529,7 @@ String buildTemperaturePlotSvg(unsigned long lookbackMs, const char *emptyLabel,
 
 String buildHistoryJson() {
   int sampledIndices[TEMP_HISTORY_API_MAX_POINTS];
-  int sampledCount = getSampledHistoryIndices(sampledIndices, TEMP_HISTORY_API_MAX_POINTS);
+  int sampledCount = getSampledBufferIndices(tempHistory, TEMP_HISTORY_CAPACITY, tempHistoryCount, tempHistoryNextIndex, sampledIndices, TEMP_HISTORY_API_MAX_POINTS);
   String json;
   json.reserve(16000);
   json += "{";
@@ -694,8 +709,8 @@ String buildDashboardHtml() {
   html += "<span class='chip'>SSID " + htmlEscape(ssid) + "</span>";
   html += "<span class='chip'>RSSI " + String(WiFi.RSSI()) + " dBm</span>";
   html += "<span class='chip'>HTTP " + String(httpResponseCode) + "</span>";
-  html += "<span class='chip'>Samples " + String(tempHistoryCount) + "/" + String(TEMP_HISTORY_CAPACITY) + "</span>";
-  html += "<span class='chip'>History step " + String(TEMP_HISTORY_SAMPLE_PERIOD_MSEC / 1000UL) + "s</span>";
+  html += "<span class='chip'>ST " + String(shortTermHistoryCount) + "/" + String(SHORT_TERM_HISTORY_CAPACITY) + " (3s)</span>";
+  html += "<span class='chip'>LT " + String(tempHistoryCount) + "/" + String(TEMP_HISTORY_CAPACITY) + " (2min)</span>";
   html += "</div></section>";
 
   html += "<div class='grid'>";
@@ -761,11 +776,12 @@ String buildDashboardHtml() {
   html += "</div>";
 
   html += "<section class='graph-wrap'><h2>T0 / T1 Temperature History</h2>";
-  html += "<div class='kv'><div class='k'>History buffer</div><div class='v mono'>" + String(tempHistoryCount) + " points stored, 1 point per " + String(TEMP_HISTORY_SAMPLE_PERIOD_MSEC / 60000UL) + " minutes, about 5 days retained</div></div>";
+  html += "<div class='kv'><div class='k'>Short-term buffer</div><div class='v mono'>" + String(shortTermHistoryCount) + "/" + String(SHORT_TERM_HISTORY_CAPACITY) + " pts, 1 per 3 s, 30-min window</div></div>";
+  html += "<div class='kv'><div class='k'>Long-term buffer</div><div class='v mono'>" + String(tempHistoryCount) + "/" + String(TEMP_HISTORY_CAPACITY) + " pts, 1 per 2 min, ~5 days retained</div></div>";
   html += "<h2 style='margin-top:16px'>Last 30 Minutes</h2>";
-  html += buildTemperaturePlotSvg(30UL * 60UL * 1000UL, "Need at least 2 temperature samples in the last 30 minutes.", "uptime (last 30 min)");
+  html += buildTemperaturePlotSvg(shortTermHistory, SHORT_TERM_HISTORY_CAPACITY, shortTermHistoryCount, shortTermHistoryNextIndex, "Need at least 2 temperature samples.", "uptime (last 30 min)");
   html += "<h2 style='margin-top:20px'>All Stored Data</h2>";
-  html += buildTemperaturePlotSvg(0, "Need at least 2 stored temperature samples.", "uptime (full retained history)");
+  html += buildTemperaturePlotSvg(tempHistory, TEMP_HISTORY_CAPACITY, tempHistoryCount, tempHistoryNextIndex, "Need at least 2 stored temperature samples.", "uptime (full retained history)");
   html += "</section>";
 
   html += "<script>";
@@ -785,6 +801,9 @@ void sendHttpResponse(WiFiClient &client, const char *contentType, const String 
   client.printf("Content-Length: %u\r\n", (unsigned int)body.length());
   client.println("Connection: close");
   client.println();
+  // Large bodies (dashboard HTML with SVG) can take several seconds to drain
+  // through the WiFi TCP stack — reset WDT so the send doesn't trigger it.
+  esp_task_wdt_reset();
   client.print(body);
 }
 
@@ -1110,9 +1129,11 @@ void loop() {
 
   bool shouldRefreshMdns = (lastmDNSLookupTimeStampMSec == 0) ||
                            ((millis() - lastmDNSLookupTimeStampMSec) > mDNSLookupTimeIntervalMSec) ||
-                           (httpResponseCode <= 0 && (millis() - lastHttpPostTimeMSec) < 30000UL);
+                           (httpResponseCode <= 0 && (millis() - lastHttpPostTimeMSec) < 30000UL &&
+                            (millis() - lastmDNSLookupTimeStampMSec) > 30000UL);
 
   if (shouldRefreshMdns) {
+    esp_task_wdt_reset();
     lastmDNSLookupTimeStampMSec = millis();
     DJBOOSHBOXIp = resolve_mdns_host(TARGET_HOSTNAME);
 
@@ -1202,6 +1223,8 @@ void serviceWebInterface() {
   if (queryPos >= 0) {
     routePath = path.substring(0, queryPos);
   }
+
+  esp_task_wdt_reset();
 
   if (routePath == "/") {
     sendHttpResponse(client, "text/html; charset=utf-8", buildDashboardHtml());
