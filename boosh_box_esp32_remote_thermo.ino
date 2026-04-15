@@ -19,6 +19,7 @@ Yellow Blue Display with ESP32-N4XX module
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <Update.h>
 #include <math.h>
 
 #if __has_include("soc/rtc_wdt.h")
@@ -179,6 +180,8 @@ void handleApiLogs();
 void handleApiConfigGet();
 void handleApiConfigPost();
 void handleApiConfigAp();
+void handleApiOta();
+void handleOtaUploadBody();
 void handleCaptivePortalRedirect();
 void setupWebServer();
 void setupApMode();
@@ -862,6 +865,19 @@ String buildDashboardHtml() {
   html += "<span id='config-status' style='font-size:13px;color:var(--muted)'></span>";
   html += "</div>";
   html += "</form></section>";
+
+  html += "<section class='panel' style='margin-top:16px'><h2>Firmware Update</h2>";
+  html += "<div class='meta'>";
+  html += "<label>Firmware .bin<input type='file' id='ota-file' accept='.bin' style='padding:8px 12px;cursor:pointer'></label>";
+  html += "<div>";
+  html += "<div id='ota-progress-wrap' style='display:none;background:#0d131c;border-radius:8px;height:18px;overflow:hidden;border:1px solid var(--border);margin-bottom:8px'>";
+  html += "<div id='ota-progress-bar' style='height:100%;width:0%;background:linear-gradient(90deg,var(--accent-2),var(--accent));transition:width .15s ease'></div>";
+  html += "</div>";
+  html += "<div style='display:flex;gap:12px;align-items:center;flex-wrap:wrap'>";
+  html += "<button id='ota-btn' disabled style='padding:8px 16px;background:var(--accent);color:#0b0f14;border:none;border-radius:8px;font-size:14px;cursor:pointer;font-weight:bold'>Upload &amp; Flash</button>";
+  html += "<span id='ota-status' style='color:var(--muted);font-size:14px'></span>";
+  html += "</div></div></div></section>";
+
   html += "</div>";
 
   html += "<section class='graph-wrap'><h2>T0 / T1 Temperature History</h2>";
@@ -883,6 +899,24 @@ String buildDashboardHtml() {
   html += "setInterval(()=>{refreshLogs().catch(()=>{});},3000);";
   html += "setInterval(()=>{refreshConfig().catch(()=>{});},5000);";
   html += "refreshLogs().catch(()=>{});refreshConfig().catch(()=>{});";
+  html += "function esc(s){return s.replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]||c));}";
+  html += "(function(){";
+  html += "const otaFile=document.getElementById('ota-file');";
+  html += "const otaBtn=document.getElementById('ota-btn');";
+  html += "const otaStatus=document.getElementById('ota-status');";
+  html += "const otaWrap=document.getElementById('ota-progress-wrap');";
+  html += "const otaBar=document.getElementById('ota-progress-bar');";
+  html += "otaFile.addEventListener('change',()=>{otaBtn.disabled=!otaFile.files.length;otaStatus.textContent=otaFile.files.length?otaFile.files[0].name:'';});";
+  html += "otaBtn.addEventListener('click',()=>{";
+  html += "const file=otaFile.files[0];if(!file)return;";
+  html += "if(!confirm('Flash '+file.name+' ('+(file.size/1024).toFixed(1)+' KB)?\\nDevice will reboot after upload.'))return;";
+  html += "otaBtn.disabled=true;otaFile.disabled=true;otaWrap.style.display='block';otaBar.style.width='0%';otaStatus.textContent='Uploading\\u2026';";
+  html += "const xhr=new XMLHttpRequest();xhr.open('POST','/api/ota');";
+  html += "xhr.upload.addEventListener('progress',(e)=>{if(e.lengthComputable){const pct=Math.round(e.loaded/e.total*100);otaBar.style.width=pct+'%';otaStatus.textContent='Uploading\\u2026 '+pct+'%';}});";
+  html += "xhr.addEventListener('load',()=>{otaBar.style.width='100%';try{const resp=JSON.parse(xhr.responseText);if(resp.ok){otaBar.style.background='linear-gradient(90deg,#2a9d3e,#4ade70)';otaStatus.textContent='Flashed! Device rebooting\\u2026';}else{otaBar.style.background='#c03a10';otaStatus.textContent='Error: '+esc(resp.error||'unknown');otaBtn.disabled=false;otaFile.disabled=false;}}catch(_){otaStatus.textContent='Upload complete';}});";
+  html += "xhr.addEventListener('error',()=>{otaBar.style.background='#c03a10';otaStatus.textContent='Upload failed (network error)';otaBtn.disabled=false;otaFile.disabled=false;});";
+  html += "const form=new FormData();form.append('firmware',file,file.name);xhr.send(form);";
+  html += "});})();";
   html += "</script>";
   html += "</div></body></html>";
   return html;
@@ -1175,6 +1209,43 @@ void handleCaptivePortalRedirect() {
   webServer.send(302, "text/plain", "");
 }
 
+// ---- OTA update handlers ----------------------------------------------------
+
+void handleOtaUploadBody() {
+  esp_task_wdt_reset();
+  HTTPUpload &upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    logEvent(String("[OTA] Start: ") + upload.filename + " (" + String(upload.totalSize) + " bytes)");
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      logEvent(String("[OTA] begin() failed: ") + Update.errorString());
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    esp_task_wdt_reset();
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      logEvent(String("[OTA] write() failed: ") + Update.errorString());
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      logEvent(String("[OTA] Success: ") + String(upload.totalSize) + " bytes written. Rebooting.");
+    } else {
+      logEvent(String("[OTA] end() failed: ") + Update.errorString());
+    }
+  }
+}
+
+void handleApiOta() {
+  if (Update.hasError()) {
+    String err = Update.errorString();
+    logEvent(String("[OTA] Aborted: ") + err);
+    webServer.send(500, "application/json",
+                   "{\"ok\":false,\"error\":\"" + err + "\"}");
+    return;
+  }
+  webServer.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
+  delay(200);
+  ESP.restart();
+}
+
 void setupWebServer() {
   if (webServerStarted) return;
   webServer.on("/",            HTTP_GET,  handleWebRoot);
@@ -1184,6 +1255,7 @@ void setupWebServer() {
   webServer.on("/api/config",  HTTP_GET,  handleApiConfigGet);
   webServer.on("/api/config",  HTTP_POST, handleApiConfigPost);
   webServer.on("/api/config/ap", HTTP_POST, handleApiConfigAp);
+  webServer.on("/api/ota",       HTTP_POST, handleApiOta, handleOtaUploadBody);
   webServer.begin();
   webServerStarted = true;
   logEvent("HTTP server listening on port 80");
