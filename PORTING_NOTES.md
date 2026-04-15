@@ -34,6 +34,17 @@ This project was developed as an Arduino IDE sketch for a `WEMOS LOLIN32` and ha
 - Periodic mDNS refresh is reduced to boot, every 15 minutes, or shortly after an HTTP failure instead of constant 1-minute refresh.
 - In bench testing after these changes, observed current draw dropped to roughly `60 mA` average or lower at about `3.7 V`.
 
+## OTA Firmware Update
+
+- Browser-based OTA via `<Update.h>` — no USB cable required after initial flash.
+- Dashboard **Firmware Update** panel: file picker (`.bin`), progress bar, Upload & Flash button.
+- POST `/api/ota` accepts a multipart upload; `handleOtaUploadBody()` streams chunks to `Update.begin/write/end`.
+- `esp_task_wdt_reset()` is called on each write chunk so the watchdog does not trip during a large upload.
+- On success the device responds `{"ok":true,"rebooting":true}` and calls `ESP.restart()`.
+- The OTA-compatible partition table (two equal 1.25 MB app slots) was already active; no partition changes needed.
+- Flash usage after adding OTA: `92.2%` (1,209,053 / 1,310,720 bytes).
+- To flash: navigate to `http://remotethermo.local/`, scroll to **Firmware Update**, select `.pio/build/esp32-oled/firmware.bin`, click Upload & Flash.
+
 ## Stability And Diagnostics Notes
 
 - ADC sampling no longer runs inside the hardware timer ISR. The ISR is now flag-only, and the actual `analogRead()` averaging runs in `loop()`. This avoids starving Wi-Fi/network work in interrupt context.
